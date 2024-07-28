@@ -1,6 +1,11 @@
 import pandas as pd
 import typing as tp
 from IPython.display import display
+from tqdm import tqdm
+import numpy as np
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score
+from lightgbm import LGBMClassifier
 
 class Dataset:
 
@@ -112,9 +117,19 @@ class Dataset:
         for sample in self.samples:
             self.__display_sample_stats(getattr(self, sample), sample)
 
-def _decrease_feature_lists(dataset: Dataset):
+# TECHNICAL METHODS ######################################################################
+
+def _decrease_feature_lists(dataset: Dataset, drop_features: list) -> None:
+
+    dataset.feature_list = [feature for feature in dataset.feature_list if feature not in drop_features]
+
     dataset.cat_features = list(set(dataset.cat_features) & set(dataset.feature_list))
     dataset.numeric_features = list(set(dataset.numeric_features) & set(dataset.feature_list))
+
+    print(f'{len(drop_features)} features were removed.')
+    print(f'The remaining number of factors is {len(dataset.feature_list)}')
+
+# FEATURE FILTERING ######################################################################
 
 def delete_nan_features(dataset: Dataset, nan_threshold: float = 0.8) -> None:
     """
@@ -123,12 +138,9 @@ def delete_nan_features(dataset: Dataset, nan_threshold: float = 0.8) -> None:
     features_nan_proportion = dataset['train'][dataset.feature_list].isna().mean()
     mask = features_nan_proportion > nan_threshold
     nan_features = features_nan_proportion[mask].index.to_list()
-    dataset.feature_list = [feature for feature in dataset.feature_list if feature not in nan_features]
 
-    _decrease_feature_lists(dataset)
+    _decrease_feature_lists(dataset, nan_features)
 
-    print(f'{len(nan_features)} features were removed.')
-    print(f'The remaining number of factors is {len(dataset.feature_list)}')
 
 def delete_high_cardinality_cat_features(
         dataset: Dataset, 
@@ -163,10 +175,69 @@ def delete_high_cardinality_cat_features(
             if dataset['train'][feature].value_counts(True)[0] < mean_unique_values:
                 high_cardinality_features.append(feature)
 
-    dataset.feature_list = [feature for feature in dataset.feature_list if feature not in high_cardinality_features]
-
-    _decrease_feature_lists(dataset)
-
-    print(f'{len(high_cardinality_features)} features were removed.')
-    print(f'The remaining number of factors is {len(dataset.feature_list)}')
+    _decrease_feature_lists(dataset, high_cardinality_features)
     
+
+def delete_duplicated_features(dataset: Dataset) -> None:
+    """
+    Removes duplicate columns. Only unique columns will be kept.
+    """
+    duplicated_features = []
+
+    for i, feature_1 in tqdm(enumerate(dataset.feature_list)):
+        if feature_1 in duplicated_features:
+            continue
+        col1 = dataset['train'][feature_1]
+        for feature_2 in dataset.feature_list[i+1:]:
+            if feature_2 in duplicated_features:
+                continue
+            col2 = dataset['train'][feature_2]
+            if col1.equals(col2):
+                duplicated_features.append(feature_2)
+
+    _decrease_feature_lists(dataset, duplicated_features)
+
+
+def delete_high_corr_features(dataset: Dataset, corr_threshold: float = 0.95) -> None:
+    """
+    Removes numeric features that correlate with others more than corr_threshold.
+    """
+    cor_matrix = dataset['train'][dataset.numeric_features].corr().abs()
+    upper_tri = cor_matrix.where(np.triu(np.ones(cor_matrix.shape), k=1).astype(bool))
+    corr_features = [feature for feature in upper_tri.columns if any(upper_tri[feature] > corr_threshold)]
+
+    _decrease_feature_lists(dataset, corr_features)
+
+
+def delete_constant_features(dataset: Dataset):
+    """
+    Removes features that have one unique value.
+    """
+    feature_unique_values = dataset['train'][dataset.feature_list].nunique()
+    mask = feature_unique_values == 1
+    constant_features = feature_unique_values[mask].index.to_list()
+
+    _decrease_feature_lists(dataset, constant_features)
+    
+# ADVERSARIAL VALIDATION ######################################################################
+
+def adversarial_tg_cg(dataset: Dataset, sample: str, folds: int = 4) -> None:
+    estimator = LGBMClassifier(n_jobs=1, verbose=0)
+    cv = StratifiedKFold(n_splits=folds, random_state=42, shuffle=True)
+
+    X = dataset[sample].loc[:, dataset.feature_list]
+    for cat_feature in dataset.cat_features:
+        X[cat_feature] = X[cat_feature].astype('category')
+    y = dataset[sample].loc[:, dataset.treatment_field]
+
+    AUCs = []
+    feat_imp = pd.Series(0, index=dataset.feature_list)
+    for train_idx, test_idx in tqdm(cv.split(X, y)):
+        estimator.fit(X.iloc[train_idx], y.iloc[train_idx], categorical_feature=dataset.cat_features)
+        pred = estimator.predict_proba(X.iloc[test_idx])[:, 1]
+        feat_imp = feat_imp + estimator.feature_importances_
+        AUCs.append(roc_auc_score(y.iloc[test_idx], pred))
+    feat_imp = feat_imp / folds
+
+    print(f'ROC-AUC in {sample} TG/CG: {round(np.mean(AUCs), 4)}')
+    display(feat_imp.nlargest(30).plot(kind='barh', figsize=(8,10), title='Adversarial feature importance'))
