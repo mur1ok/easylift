@@ -6,6 +6,7 @@ import numpy as np
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score
 from lightgbm import LGBMClassifier
+from scipy.stats import norm
 
 class Dataset:
 
@@ -222,6 +223,17 @@ def delete_constant_features(dataset: Dataset):
 # ADVERSARIAL VALIDATION ######################################################################
 
 def adversarial_tg_cg(dataset: Dataset, sample: str, folds: int = 4) -> None:
+    """
+    A test to check the quality of splitting into control and treatment groups. The meta-classifier is 
+    trained on the specified sample. The features used are those that have been 
+    selected to date. The target is the treatment group flag. The average value of the ROC-AUC is returned 
+    based on cross-validation and the top features of the meta-classifier.
+
+    Parameters:
+        dataset (Dataset): Dataset instance
+        sample (str): Name of the sample to be tested.
+        folds (int): Number of folders for cross-validation. Default 4
+    """
     estimator = LGBMClassifier(n_jobs=1, verbose=0)
     cv = StratifiedKFold(n_splits=folds, random_state=42, shuffle=True)
 
@@ -240,4 +252,84 @@ def adversarial_tg_cg(dataset: Dataset, sample: str, folds: int = 4) -> None:
     feat_imp = feat_imp / folds
 
     print(f'ROC-AUC in {sample} TG/CG: {round(np.mean(AUCs), 4)}')
-    display(feat_imp.nlargest(30).plot(kind='barh', figsize=(8,10), title='Adversarial feature importance'))
+    display(feat_imp.nlargest(30).plot(kind='barh', figsize=(8,10), title='Feature importance'))
+
+def adversarial_split_quality(dataset: Dataset, sample_1: str, sample_2: str, folds: int = 4) -> None:
+    """
+    They will check two samples for independence of partition. The meta-classifier is trained by 
+    the features used to determine which observations are from the first sample and which are from the second.
+    The average value of the ROC-AUC is returned based on cross-validation and the top features of the meta-classifier.
+
+    Parameters:
+        dataset (Dataset): Dataset instance
+        sample_1 (str): Name of the first sample.
+        sample_2 (str): Name of the second sample.
+        folds (int): Number of folders for cross-validation. Default 4
+    """
+    estimator = LGBMClassifier(n_jobs=1, verbose=0)
+    cv = StratifiedKFold(n_splits=folds, random_state=42, shuffle=True)
+
+    X = pd.concat(
+        [
+            dataset[sample_1].loc[:, dataset.feature_list],
+            dataset[sample_2].loc[:, dataset.feature_list]
+        ]
+    )
+    for cat_feature in dataset.cat_features:
+        X[cat_feature] = X[cat_feature].astype('category')
+
+    y = np.array([0]*len(dataset[sample_1]) + [1]*len(dataset[sample_2]))
+
+    AUCs = []
+    feat_imp = pd.Series(0, index=dataset.feature_list)
+    for train_idx, test_idx in tqdm(cv.split(X, y)):
+        estimator.fit(X.iloc[train_idx], y[train_idx], categorical_feature=dataset.cat_features)
+        pred = estimator.predict_proba(X.iloc[test_idx])[:, 1]
+        feat_imp = feat_imp + estimator.feature_importances_
+        AUCs.append(roc_auc_score(y[test_idx], pred))
+    feat_imp = feat_imp / folds
+
+    print(f'ROC-AUC in {sample_1}/{sample_2} split: {round(np.mean(AUCs), 4)}')
+    display(feat_imp.nlargest(30).plot(kind='barh', figsize=(8,10), title='Feature importance'))
+
+# STATISTICAL CHECKS OF A/B TEST ######################################################################
+
+def two_proprotions_confint(dataset: Dataset, significance: float = 0.05, sample: tp.Optional[str] = None):
+    """
+    A/B test for two proportions;
+    given a success a trial size of group A and B compute its confidence interval.
+
+    Parameters:
+        dataset (Dataset): Dataset instance
+        
+        significance (float): Often denoted as alpha. Governs the chance of a false positive.
+        A significance level of 0.05 means that there is a 5% chance of a false positive. In other words, 
+        our confidence level is 1 - 0.05 = 0.95
+        
+        sample (str, optional): The name of the sample for which the check is to be performed. If nothing is 
+        transferred, the calculation will be performed on all available data.
+
+    Source: https://stackoverflow.com/questions/47570903/confidence-interval-for-the-difference-between-two-proportions-in-python
+    """
+
+    if sample is not None:
+        data = dataset[sample]
+    else:
+        data = pd.concat([dataset[sample] for sample in dataset.samples])
+    
+    group_a = data[data[dataset.treatment_field] == 0]
+    size_a = group_a.shape[0]
+    prop_a = group_a[dataset.target_field].mean()
+
+    group_b = data[data[dataset.treatment_field] == 1]
+    prop_b = group_b[dataset.target_field].mean()
+    size_b = group_b.shape[0]
+
+    var = prop_a * (1 - prop_a) / size_a + prop_b * (1 - prop_b) / size_b
+    se = np.sqrt(var)
+    z = norm.ppf(1 - significance/2)
+    prop_diff = prop_b - prop_a
+
+    print(f'Proportions difference: {prop_diff}')
+    print(f'Confidence interval: {(prop_diff - z*se, prop_diff + z*se)}')
+    print(f'0 in confidence interval: {prop_diff - z*se < 0 < prop_diff + z*se}')
