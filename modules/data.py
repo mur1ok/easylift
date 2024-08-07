@@ -4,9 +4,13 @@ from IPython.display import display
 from tqdm import tqdm
 import numpy as np
 from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import roc_auc_score
 from lightgbm import LGBMClassifier
 from scipy.stats import norm
+from causalml.feature_selection.filters import FilterSelect
+from pandas.api.types import is_numeric_dtype
+
 
 class Dataset:
 
@@ -18,6 +22,8 @@ class Dataset:
             info_fields: tp.Optional[tp.List] = None,
             numeric_features: tp.Optional[tp.List] = None,
             cat_features: tp.Optional[tp.List] = None,
+            control_group: tp.Any = 0,
+            treatment_group: tp.Any = 1,
             valid: tp.Optional[pd.DataFrame] = None,
             test: tp.Optional[pd.DataFrame] = None,  
             show_stats: bool = True
@@ -31,6 +37,8 @@ class Dataset:
             target_field (str): The name of the column representing the target variable (outcome) to be predicted.
             info_fields (list, optional): A list of columns that serve as unique identifiers for observations or are other service information that should not be used in modeling. Defaults to an empty list.
             numeric_features (list, optional): A list of columns that are numeric features to be included in the modeling. Defaults to an empty list.
+            control_group (any): The index of the control group. Defaults to 0.
+            treatment_group (any): The index of the treatment group. Defaults to 1.
             cat_features (list, optional): A list of columns that are categorical features to be included in the modeling. Defaults to an empty list.
             valid (pd.DataFrame, optional): An optional validation dataset for model evaluation. Defaults to None.
             test (pd.DataFrame, optional): An optional test dataset for final model evaluation. Defaults to None.
@@ -43,12 +51,17 @@ class Dataset:
         if treatment_field not in train.columns:
             raise ValueError(f"The 'treatment_field' '{treatment_field}' is not present in the training DataFrame.")
 
+        if train[treatment_field].nunique() != 2:
+            raise ValueError(f"The 'treatment_field' '{treatment_field}' must have exactly two unique values.")
+
         if target_field not in train.columns:
             raise ValueError(f"The 'target_field' '{target_field}' is not present in the training DataFrame.")
         
         self.samples = ['train']
         self.__setattr__('train', train)
         self.treatment_field = treatment_field
+        self.treatment_group = treatment_group
+        self.control_group = control_group
         self.target_field = target_field
         self.info_fields = info_fields
         
@@ -219,6 +232,60 @@ def delete_constant_features(dataset: Dataset):
     constant_features = feature_unique_values[mask].index.to_list()
 
     _decrease_feature_lists(dataset, constant_features)
+
+def F_filter(
+        dataset: Dataset, 
+        order: int = 1, 
+        p_value: float = 0.05,
+        fillna_value: float = 0,
+    ) -> None:
+    """
+    Removes features that do not pass the F-test.
+    The function uses the CausalML FilterSelect class to calculate the importance of each feature using the F-test.
+    It then removes the features that have a p-value greater than the specified threshold.
+    """
+    filter_method = FilterSelect()
+    f_imp = filter_method.get_importance(
+        dataset['train'].fillna(fillna_value), 
+        dataset.numeric_features, 
+        dataset.target_field, 
+        'F', 
+        experiment_group_column = dataset.treatment_field,
+        control_group = dataset.control_group,
+        treatment_group = dataset.treatment_group,
+        order = order
+    )
+    removed_features = f_imp[f_imp['p_value'] > p_value]['feature'].to_list()
+
+    _decrease_feature_lists(dataset, removed_features)
+
+
+def LR_filter(
+        dataset: Dataset, 
+        order: int = 1, 
+        p_value: float = 0.05,
+        fillna_value: float = 0,
+    ) -> None:
+    """
+    Removes features that do not pass the Logistic Regression test.
+    The function uses the CausalML FilterSelect class to calculate the importance of each feature using 
+    the Logistic Regression test. It then removes the features that have a p-value greater than the specified threshold.
+    """
+    filter_method = FilterSelect()
+    f_imp = filter_method.get_importance(
+        dataset['train'].fillna(fillna_value), 
+        dataset.numeric_features, 
+        dataset.target_field, 
+        'LR', 
+        experiment_group_column = dataset.treatment_field,
+        control_group = dataset.control_group,
+        treatment_group = dataset.treatment_group,
+        order = order
+    )
+    removed_features = f_imp[f_imp['p_value'] > p_value]['feature'].to_list()
+
+    _decrease_feature_lists(dataset, removed_features)
+
     
 # ADVERSARIAL VALIDATION ######################################################################
 
@@ -241,6 +308,8 @@ def adversarial_tg_cg(dataset: Dataset, sample: str, folds: int = 4) -> None:
     for cat_feature in dataset.cat_features:
         X[cat_feature] = X[cat_feature].astype('category')
     y = dataset[sample].loc[:, dataset.treatment_field]
+    if not is_numeric_dtype(y):
+        y = LabelEncoder().fit_transform(y)
 
     AUCs = []
     feat_imp = pd.Series(0, index=dataset.feature_list)
@@ -317,11 +386,11 @@ def two_proprotions_confint(dataset: Dataset, significance: float = 0.05, sample
     else:
         data = pd.concat([dataset[sample] for sample in dataset.samples])
     
-    group_a = data[data[dataset.treatment_field] == 0]
+    group_a = data[data[dataset.treatment_field] == dataset.control_group]
     size_a = group_a.shape[0]
     prop_a = group_a[dataset.target_field].mean()
 
-    group_b = data[data[dataset.treatment_field] == 1]
+    group_b = data[data[dataset.treatment_field] == dataset.treatment_group]
     prop_b = group_b[dataset.target_field].mean()
     size_b = group_b.shape[0]
 
