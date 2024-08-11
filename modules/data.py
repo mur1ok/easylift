@@ -10,7 +10,8 @@ from lightgbm import LGBMClassifier
 from scipy.stats import norm
 from causalml.feature_selection.filters import FilterSelect
 from pandas.api.types import is_numeric_dtype
-
+import seaborn as sns
+import matplotlib.pyplot as plt
 
 class Dataset:
 
@@ -237,12 +238,14 @@ def F_filter(
         dataset: Dataset, 
         order: int = 1, 
         p_value: float = 0.05,
-        fillna_value: float = 0,
+        fillna_value: float = 0
     ) -> None:
     """
     Removes features that do not pass the F-test.
     The function uses the CausalML FilterSelect class to calculate the importance of each feature using the F-test.
     It then removes the features that have a p-value greater than the specified threshold.
+
+    Paper: https://arxiv.org/pdf/2005.03447
     """
     filter_method = FilterSelect()
     f_imp = filter_method.get_importance(
@@ -264,12 +267,14 @@ def LR_filter(
         dataset: Dataset, 
         order: int = 1, 
         p_value: float = 0.05,
-        fillna_value: float = 0,
+        fillna_value: float = 0
     ) -> None:
     """
     Removes features that do not pass the Logistic Regression test.
     The function uses the CausalML FilterSelect class to calculate the importance of each feature using 
     the Logistic Regression test. It then removes the features that have a p-value greater than the specified threshold.
+
+    Paper: https://arxiv.org/pdf/2005.03447
     """
     filter_method = FilterSelect()
     f_imp = filter_method.get_importance(
@@ -286,6 +291,36 @@ def LR_filter(
 
     _decrease_feature_lists(dataset, removed_features)
 
+def KL_filter(
+        dataset: Dataset,
+        n_bins: int = 10,
+        score: float = 1e-5,
+        fillna_value: float = 0
+) -> None:
+    """
+    Removes features that do not pass the Kullback-Leibler divergence test. 
+    The function uses the CausalML FilterSelect class to calculate the importance of each feature 
+    using the Kullback-Leibler divergence test. It then removes the features that have a score lower 
+    than the specified threshold.
+
+    Paper: https://arxiv.org/pdf/2005.03447
+    """
+    
+    filter_method = FilterSelect()
+    f_imp = filter_method.get_importance(
+        dataset['train'].fillna(fillna_value), 
+        dataset.numeric_features, 
+        dataset.target_field, 
+        'KL', 
+        experiment_group_column = dataset.treatment_field,
+        control_group = dataset.control_group,
+        treatment_group = dataset.treatment_group,
+        n_bins = n_bins
+    )
+
+    removed_features = f_imp[f_imp['score'] < score]['feature'].to_list()
+
+    _decrease_feature_lists(dataset, removed_features)
     
 # ADVERSARIAL VALIDATION ######################################################################
 
@@ -321,7 +356,11 @@ def adversarial_tg_cg(dataset: Dataset, sample: str, folds: int = 4) -> None:
     feat_imp = feat_imp / folds
 
     print(f'ROC-AUC in {sample} TG/CG: {round(np.mean(AUCs), 4)}')
-    display(feat_imp.nlargest(30).plot(kind='barh', figsize=(8,10), title='Feature importance'))
+    
+    for_plotting = feat_imp.nlargest(30)
+    sns.barplot(x=for_plotting, y=for_plotting.index, orient='h',)
+    plt.title('Feature importance')
+    plt.show()
 
 def adversarial_split_quality(dataset: Dataset, sample_1: str, sample_2: str, folds: int = 4) -> None:
     """
@@ -359,7 +398,11 @@ def adversarial_split_quality(dataset: Dataset, sample_1: str, sample_2: str, fo
     feat_imp = feat_imp / folds
 
     print(f'ROC-AUC in {sample_1}/{sample_2} split: {round(np.mean(AUCs), 4)}')
-    display(feat_imp.nlargest(30).plot(kind='barh', figsize=(8,10), title='Feature importance'))
+    
+    for_plotting = feat_imp.nlargest(30)
+    sns.barplot(x=for_plotting, y=for_plotting.index, orient='h',)
+    plt.title('Feature importance')
+    plt.show()
 
 # STATISTICAL CHECKS OF A/B TEST ######################################################################
 
@@ -402,4 +445,60 @@ def two_proprotions_confint(dataset: Dataset, significance: float = 0.05, sample
     print(f'Proportions difference: {prop_diff}')
     print(f'Confidence interval: {(prop_diff - z*se, prop_diff + z*se)}')
     print(f'0 in confidence interval: {prop_diff - z*se < 0 < prop_diff + z*se}')
+
+def psi_cg_tg(
+        dataset: Dataset,
+        sample: tp.Optional[str] = None,
+        num_bins: int = 15,
+        save_path: tp.Optional[str] = None,
+    ) -> None:
+    """
+    Calculates the PSI (Population Stability Index) for each feature in the dataset.
+    """
+    if sample is not None:
+        data = dataset[sample]
+    else:
+        data = pd.concat([dataset[sample] for sample in dataset.samples])
+
+    res_psi = pd.DataFrame(
+        {
+            'feature': dataset.feature_list,
+            'psi': [0. for _ in range(len(dataset.feature_list))]
+        }
+    )
+
+    def make_distribution(full_data, clear_data, nan_bin):
+        bins = nan_bin + [str(bucket) for bucket in sorted(clear_data.unique())]
+        full_data = pd.concat([clear_data, full_data[full_data.isna()]]) if full_data.isna().any() else clear_data
+        return full_data.astype(str).value_counts(True)[bins]
+
+    for feature in tqdm(dataset.feature_list):
+        control_group = data[data[dataset.treatment_field] == dataset.control_group][feature].fillna(np.nan)
+        treatment_group = data[data[dataset.treatment_field] == dataset.treatment_group][feature].fillna(np.nan)
+
+        control_group_clear = control_group.dropna()
+        treatment_group_clear = treatment_group.dropna()
+
+        nan_bin = ['nan'] if control_group.isna().any() or treatment_group.isna().any() else []
+
+        if feature not in dataset.cat_features and control_group_clear.nunique() > num_bins:
+            bins = [-np.inf] + list(np.histogram(control_group_clear, bins=num_bins)[1]) + [np.inf]
+            control_group_clear = pd.cut(control_group_clear, bins=bins)
+            treatment_group_clear = pd.cut(treatment_group_clear, bins=bins)
+
+        control_group = make_distribution(control_group, control_group_clear, nan_bin)
+        treatment_group = make_distribution(treatment_group, treatment_group_clear, nan_bin)
+
+        psi = 0
+        for bucket in sorted(set(control_group.index).union(set(treatment_group.index))):
+            a_value = control_group.get(bucket, 1e-10)
+            b_value = treatment_group.get(bucket, 1e-10)
+            psi += (a_value - b_value) * np.log(a_value / b_value)
+        res_psi.loc[res_psi['feature'] == feature, 'psi'] = psi
+
+    res_psi = res_psi.sort_values(by='psi', ascending=False)
+    if save_path is not None:
+        res_psi.to_csv(save_path, index=False)
+    display(res_psi)
+
 
