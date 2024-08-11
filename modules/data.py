@@ -1,17 +1,19 @@
-import pandas as pd
 import typing as tp
-from IPython.display import display
-from tqdm import tqdm
+
+import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
+import seaborn as sns
+from causalml.feature_selection.filters import FilterSelect
+from IPython.display import display
+from lightgbm import LGBMClassifier
+from pandas.api.types import is_numeric_dtype
+from scipy.stats import norm
+from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import roc_auc_score
-from lightgbm import LGBMClassifier
-from scipy.stats import norm
-from causalml.feature_selection.filters import FilterSelect
-from pandas.api.types import is_numeric_dtype
-import seaborn as sns
-import matplotlib.pyplot as plt
+from tqdm import tqdm
+
 
 class Dataset:
 
@@ -356,7 +358,7 @@ def adversarial_tg_cg(dataset: Dataset, sample: str, folds: int = 4) -> None:
     feat_imp = feat_imp / folds
 
     print(f'ROC-AUC in {sample} TG/CG: {round(np.mean(AUCs), 4)}')
-    
+
     for_plotting = feat_imp.nlargest(30)
     sns.barplot(x=for_plotting, y=for_plotting.index, orient='h',)
     plt.title('Feature importance')
